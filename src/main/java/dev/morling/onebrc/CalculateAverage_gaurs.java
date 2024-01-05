@@ -20,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -52,22 +53,18 @@ public class CalculateAverage_gaurs {
         }
     }
 
-    private record Entry(String key, double value) {
-
-    }
-
     public static void main(String[] args) throws IOException {
+        Map<String, Measurement> resultMap = new ConcurrentHashMap<>();
         Stream<String> lines = Files.lines(Path.of(FILE), StandardCharsets.UTF_8);
-        Map<String, CalculateAverage_gaurs.Measurement> resultMap = lines.parallel().map(record -> {
+
+        lines.parallel().forEach(record -> {
             String[] parts = record.split(";");
             String station = parts[0];
             double temperature = Double.parseDouble(parts[1]);
+            Measurement measurement = new Measurement(temperature);
 
-            return new Entry(station, temperature);
-        }).collect(Collectors.toConcurrentMap(
-                Entry::key,
-                entry -> new CalculateAverage_gaurs.Measurement(entry.value()),
-                CalculateAverage_gaurs.Measurement::merge));
+            resultMap.compute(station, (key, existingMeasurement) -> existingMeasurement == null ? measurement : Measurement.merge(existingMeasurement, measurement));
+        });
 
         System.out.print("{");
 
