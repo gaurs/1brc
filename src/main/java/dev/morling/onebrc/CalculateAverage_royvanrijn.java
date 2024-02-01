@@ -15,456 +15,539 @@
  */
 package dev.morling.onebrc;
 
-import java.io.File;
 import java.io.IOException;
-import java.io.RandomAccessFile;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
+import java.lang.foreign.Arena;
+import java.lang.reflect.Field;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
-import java.util.TreeMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
+
+import sun.misc.Unsafe;
 
 /**
  * Changelog:
  *
- * Initial submission:          62000 ms
- * Chunked reader:              16000 ms
- * Optimized parser:            13000 ms
- * Branchless methods:          11000 ms
- * Adding memory mapped files:  6500 ms (based on bjhara's submission)
- * Skipping string creation:    4700 ms
- * Custom hashmap...            4200 ms
- * Added SWAR token checks:     3900 ms
- * Skipped String creation:     3500 ms (idea from kgonia)
- * Improved String skip:        3250 ms
- * Segmenting files:            3150 ms (based on spullara's code)
- * Not using SWAR for EOL:      2850 ms
- * Inlining hash calculation:   2450 ms
+ * Initial submission:               62000 ms
+ * Chunked reader:                   16000 ms
+ * Optimized parser:                 13000 ms
+ * Branchless methods:               11000 ms
+ * Adding memory mapped files:       6500 ms (based on bjhara's submission)
+ * Skipping string creation:         4700 ms
+ * Custom hashmap...                 4200 ms
+ * Added SWAR token checks:          3900 ms
+ * Skipped String creation:          3500 ms (idea from kgonia)
+ * Improved String skip:             3250 ms
+ * Segmenting files:                 3150 ms (based on spullara's code)
+ * Not using SWAR for EOL:           2850 ms
+ * Inlining hash calculation:        2450 ms
+ * Replacing branchless code:        2200 ms (sometimes we need to kill the things we love)
+ * Added unsafe memory access:       1900 ms (keeping the long[] small and local)
+ * Fixed bug, UNSAFE bytes String:   1850 ms
+ * Separate hash from entries:       1550 ms
+ * Various tweaks for Linux/cache    1550 ms (should/could make a difference on target machine)
+ * Improved layout/predictability:   1400 ms
+ * Delayed String creation again:    1350 ms
+ * Remove writing to buffer:         1335 ms
+ * Optimized collecting at the end:  1310 ms
+ * Adding a lot of comments:         priceless
+ * Changed to flyweight byte[]:      1290 ms (adds even more Unsafe, was initially slower, now faster)
+ * More LOC now parallel:            1260 ms (moved more to processMemoryArea, recombining in ConcurrentHashMap)
+ * Storing only the address:         1240 ms (this is now faster, tried before, was slower)
+ * Unrolling scan-loop:              1200 ms (seems to help, perhaps even more on target machine)
+ * Adding more readable reader:      1300 ms (scores got worse on target machine anyway)
  *
- * Best performing JVM on MacBook M2 Pro: 21.0.1-graal
- * `sdk use java 21.0.1-graal`
+ * Using old x86 MacBook and perf:   3500 ms (different machine for testing)
+ * Decided to rewrite loop for 16 b: 3050 ms
+ * Small changes, limited heap:      2950 ms
  *
+ * I have some instructions that could be removed, but faster with...
+ *
+ * Big thanks to Francesco Nigro, Thomas Wuerthinger, Quan Anh Mai and many others for ideas.
+ *
+ * Follow me at: @royvanrijn
  */
 public class CalculateAverage_royvanrijn {
 
     private static final String FILE = "./measurements.txt";
+    // private static final String FILE = "src/test/resources/samples/measurements-1.txt";
 
-    // mutable state now instead of records, ugh, less instantiation.
-    static final class Measurement {
-        int min, max, count;
-        long sum;
+    private static final Unsafe UNSAFE = initUnsafe();
 
-        public Measurement() {
-            this.min = 1000;
-            this.max = -1000;
-        }
+    // Twice the processors, smoothens things out.
+    private static final int PROCESSORS = Runtime.getRuntime().availableProcessors();
 
-        public Measurement updateWith(int measurement) {
-            min = min(min, measurement);
-            max = max(max, measurement);
-            sum += measurement;
-            count++;
-            return this;
-        }
+    /**
+     * Flyweight entry in a byte[], max 128 bytes.
+     * <p>
+     * long: sum
+     * int:  min
+     * int:  max
+     * int:  count
+     * byte: length
+     * byte[]: cityname
+     */
+    // ------------------------------------------------------------------------
+    private static final int ENTRY_LENGTH = (Unsafe.ARRAY_BYTE_BASE_OFFSET);
+    private static final int ENTRY_SUM = (ENTRY_LENGTH + Byte.BYTES);
+    private static final int ENTRY_MIN = (ENTRY_SUM + Long.BYTES);
+    private static final int ENTRY_MAX = (ENTRY_MIN + Integer.BYTES);
+    private static final int ENTRY_COUNT = (ENTRY_MAX + Integer.BYTES);
+    private static final int ENTRY_NAME = (ENTRY_COUNT + Integer.BYTES);
+    private static final int ENTRY_NAME_8 = ENTRY_NAME + 8;
+    private static final int ENTRY_NAME_16 = ENTRY_NAME + 16;
 
-        public Measurement updateWith(Measurement measurement) {
-            min = min(min, measurement.min);
-            max = max(max, measurement.max);
-            sum += measurement.sum;
-            count += measurement.count;
-            return this;
-        }
+    private static final int ENTRY_BASESIZE_WHITESPACE = ENTRY_NAME + 7; // with enough empty bytes to fill a long
+    // ------------------------------------------------------------------------
+    private static final int PREMADE_MAX_SIZE = 1 << 5; // pre-initialize some entries in memory, keep them close
+    private static final int PREMADE_ENTRIES = 512; // amount of pre-created entries we should use
+    private static final int TABLE_SIZE = 1 << 19; // large enough for the contest.
+    private static final int TABLE_MASK = (TABLE_SIZE - 1);
 
-        public String toString() {
-            return round(min) + "/" + round((1.0 * sum) / count) + "/" + round(max);
-        }
-
-        private double round(double value) {
-            return Math.round(value) / 10.0;
-        }
+    // Idea of thomaswue, don't wait for slow unmap:
+    private static void spawnWorker() throws IOException {
+        ProcessHandle.Info info = ProcessHandle.current().info();
+        ArrayList<String> workerCommand = new ArrayList<>();
+        info.command().ifPresent(workerCommand::add);
+        info.arguments().ifPresent(args -> workerCommand.addAll(Arrays.asList(args)));
+        workerCommand.add("--worker");
+        new ProcessBuilder()
+                .command(workerCommand)
+                .inheritIO()
+                .redirectOutput(ProcessBuilder.Redirect.PIPE)
+                .start()
+                .getInputStream()
+                .transferTo(System.out);
     }
 
     public static void main(String[] args) throws Exception {
-        new CalculateAverage_royvanrijn().run();
-        // new CalculateAverage_royvanrijn().runTests();
+
+        if (args.length == 0 || !("--worker".equals(args[0]))) {
+            spawnWorker();
+            return;
+        }
+
+        // Calculate input segments.
+        final FileChannel fileChannel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ);
+        final long fileSize = fileChannel.size();
+        final long segmentSize = (fileSize + PROCESSORS - 1) / PROCESSORS;
+        final long mapAddress = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global()).address();
+
+        final Thread[] parallelThreads = new Thread[PROCESSORS - 1];
+
+        // This is where the entries will land:
+        final ConcurrentHashMap<String, byte[]> measurements = new ConcurrentHashMap(1 << 10);
+
+        // We create separate threads for twice the amount of processors.
+        long lastAddress = mapAddress;
+        final long endOfFile = mapAddress + fileSize;
+        for (int i = 0; i < PROCESSORS - 1; ++i) {
+
+            final long fromAddress = lastAddress;
+            final long toAddress = Math.min(endOfFile, fromAddress + segmentSize);
+
+            final Thread thread = new Thread(() -> {
+                // The actual work is done here:
+                final byte[][] table = processMemoryArea(fromAddress, toAddress, fromAddress == mapAddress);
+
+                for (byte[] entry : table) {
+                    if (entry != null) {
+                        measurements.merge(entryToName(entry), entry, CalculateAverage_royvanrijn::mergeEntry);
+                    }
+                }
+            });
+            thread.start(); // start a.s.a.p.
+            parallelThreads[i] = thread;
+            lastAddress = toAddress;
+        }
+
+        // Use the current thread for the part of memory:
+        final byte[][] table = processMemoryArea(lastAddress, mapAddress + fileSize, false);
+
+        for (byte[] entry : table) {
+            if (entry != null) {
+                measurements.merge(entryToName(entry), entry, CalculateAverage_royvanrijn::mergeEntry);
+            }
+        }
+        // Wait for all threads to finish:
+        for (Thread thread : parallelThreads) {
+            // Can we implement work-stealing? Not sure how...
+            thread.join();
+        }
+
+        // If we don't reach start of file,
+        System.out.print("{" +
+                measurements.entrySet().stream().sorted(Map.Entry.comparingByKey())
+                        .map(entry -> entry.getKey() + '=' + entryValuesToString(entry.getValue()))
+                        .collect(Collectors.joining(", ")));
+        System.out.println("}");
+
+        System.out.close(); // close the stream to stop
     }
 
-    private void testInput(final String inputString, final int start, final boolean bigEndian, final int[] expectedDelimiterAndHash, final long[] expectedCityNameLong) {
+    private static byte[] fillEntry(final byte[] entry, final long fromAddress, final int entryLength, final int temp, final long readBuffer1, final long readBuffer2) {
+        UNSAFE.putLong(entry, ENTRY_SUM, temp);
+        UNSAFE.putInt(entry, ENTRY_MIN, temp);
+        UNSAFE.putInt(entry, ENTRY_MAX, temp);
+        UNSAFE.putInt(entry, ENTRY_COUNT, 1);
+        UNSAFE.putByte(entry, ENTRY_LENGTH, (byte) entryLength);
+        UNSAFE.copyMemory(null, fromAddress, entry, ENTRY_NAME, entryLength - 16);
+        UNSAFE.putLong(entry, ENTRY_NAME + entryLength - 16, readBuffer1);
+        UNSAFE.putLong(entry, ENTRY_NAME + entryLength - 8, readBuffer2);
+        return entry;
+    }
 
-        byte[] input = inputString.getBytes(StandardCharsets.UTF_8);
+    private static byte[] fillEntry16(final byte[] entry, final int entryLength, final int temp, final long readBuffer1, final long readBuffer2) {
+        UNSAFE.putLong(entry, ENTRY_SUM, temp);
+        UNSAFE.putInt(entry, ENTRY_MIN, temp);
+        UNSAFE.putInt(entry, ENTRY_MAX, temp);
+        UNSAFE.putInt(entry, ENTRY_COUNT, 1);
+        UNSAFE.putByte(entry, ENTRY_LENGTH, (byte) entryLength);
+        UNSAFE.putLong(entry, ENTRY_NAME + entryLength - 16, readBuffer1);
+        UNSAFE.putLong(entry, ENTRY_NAME + entryLength - 8, readBuffer2);
+        return entry;
+    }
 
-        ByteBuffer buffer = ByteBuffer.wrap(input).order(bigEndian ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN);
+    public static void updateEntry(final byte[] entry, final int temp) {
 
-        int[] output = new int[2];
-        long[] cityName = new long[128];
-        findNextDelimiterAndCalculateHash(buffer, SEPARATOR_PATTERN, start, buffer.limit(), output, cityName, bigEndian);
+        int entryMin = UNSAFE.getInt(entry, ENTRY_MIN);
+        int entryMax = UNSAFE.getInt(entry, ENTRY_MAX);
+        long entrySum = UNSAFE.getLong(entry, ENTRY_SUM) + temp;
+        int entryCount = UNSAFE.getInt(entry, ENTRY_COUNT) + 1;
 
-        if (!Arrays.equals(output, expectedDelimiterAndHash)) {
-            System.out.println("Error in delimiter or hash");
-            System.out.println("Expected: " + Arrays.toString(expectedDelimiterAndHash));
-            System.out.println("Received: " + Arrays.toString(output));
+        if (temp < entryMin) {
+            UNSAFE.putInt(entry, ENTRY_MIN, temp);
         }
-        int amountLong = 1 + ((output[0] - start) >>> 3);
-        if (!Arrays.equals(cityName, 0, amountLong, expectedCityNameLong, 0, amountLong)) {
-            System.out.println("Error in long array");
-            System.out.println("Expected: " + Arrays.toString(expectedCityNameLong));
-            System.out.println("Received: " + Arrays.toString(cityName));
+        else if (temp > entryMax) {
+            UNSAFE.putInt(entry, ENTRY_MAX, temp);
+        }
+        UNSAFE.putInt(entry, ENTRY_COUNT, entryCount);
+        UNSAFE.putLong(entry, ENTRY_SUM, entrySum);
+    }
+
+    public static byte[] mergeEntry(final byte[] entry, final byte[] merge) {
+
+        long sum = UNSAFE.getLong(merge, ENTRY_SUM);
+        final int mergeMin = UNSAFE.getInt(merge, ENTRY_MIN);
+        final int mergeMax = UNSAFE.getInt(merge, ENTRY_MAX);
+        int count = UNSAFE.getInt(merge, ENTRY_COUNT);
+
+        sum += UNSAFE.getLong(entry, ENTRY_SUM);
+        count += UNSAFE.getInt(entry, ENTRY_COUNT);
+
+        int entryMin = UNSAFE.getInt(entry, ENTRY_MIN);
+        int entryMax = UNSAFE.getInt(entry, ENTRY_MAX);
+        entryMin = Math.min(entryMin, mergeMin);
+        entryMax = Math.max(entryMax, mergeMax);
+        UNSAFE.putInt(entry, ENTRY_MIN, entryMin);
+        UNSAFE.putInt(entry, ENTRY_MAX, entryMax);
+
+        UNSAFE.putLong(entry, ENTRY_SUM, sum);
+        UNSAFE.putInt(entry, ENTRY_COUNT, count);
+        return entry;
+    }
+
+    private static String entryToName(final byte[] entry) {
+        // Get the length from memory:
+        int length = UNSAFE.getByte(entry, ENTRY_LENGTH);
+
+        byte[] name = new byte[length];
+        UNSAFE.copyMemory(entry, ENTRY_NAME, name, Unsafe.ARRAY_BYTE_BASE_OFFSET, length);
+
+        // Create a new String with the existing byte[]:
+        return new String(name, StandardCharsets.UTF_8).trim();
+    }
+
+    private static String entryValuesToString(final byte[] entry) {
+        return (round(UNSAFE.getInt(entry, ENTRY_MIN))
+                + "/" +
+                round((1.0 * UNSAFE.getLong(entry, ENTRY_SUM)) /
+                        UNSAFE.getInt(entry, ENTRY_COUNT))
+                + "/" +
+                round(UNSAFE.getInt(entry, ENTRY_MAX)));
+    }
+
+    // Print a piece of memory:
+    // For debug.
+    private static String printMemory(final Object target, final long address, int length) {
+        String result = "";
+        for (int i = 0; i < length; i++) {
+            result += (char) UNSAFE.getByte(target, address + i);
+        }
+        return result;
+    }
+
+    // Print a piece of memory:
+    // For debug.
+    private static String printMemory(final long value, int length) {
+        String result = "";
+        for (int i = 0; i < length; i++) {
+            result += (char) ((value >> (i << 3)) & 0xFF);
+        }
+        return result;
+    }
+
+    private static double round(final double value) {
+        return Math.round(value) / 10.0;
+    }
+
+    private static final class Reader {
+
+        private long ptr;
+        private long readBuffer1;
+        private long readBuffer2;
+
+        private long hash;
+        private long entryStart;
+        private int entryLength; // in bytes rounded to nearest 16
+
+        private final long endAddress;
+
+        Reader(final long startAddress, final long endAddress, final boolean isFileStart) {
+
+            this.ptr = startAddress;
+            this.endAddress = endAddress;
+
+            // Adjust start to next delimiter:
+            if (!isFileStart) {
+                ptr--;
+                while (ptr < endAddress) {
+                    if (UNSAFE.getByte(ptr++) == '\n') {
+                        break;
+                    }
+                }
+            }
+        }
+
+        private void processStart() {
+            hash = 0;
+            entryStart = ptr;
+            entryLength = 0;
+        }
+
+        private boolean hasNext() {
+            return (ptr < endAddress);
+        }
+
+        private static final long DELIMITER_MASK = 0x3B3B3B3B3B3B3B3BL;
+
+        private boolean readNext() {
+
+            long lastRead = UNSAFE.getLong(ptr);
+
+            entryLength += 16;
+
+            // Find delimiter and create mask for long1
+            long comparisonResult1 = (lastRead ^ DELIMITER_MASK);
+            long highBitMask1 = (comparisonResult1 - 0x0101010101010101L) & (~comparisonResult1 & 0x8080808080808080L);
+
+            boolean noContent1 = highBitMask1 == 0;
+            long mask1 = noContent1 ? 0 : ~((highBitMask1 >>> 7) - 1);
+            int position1 = noContent1 ? 0 : 1 + (Long.numberOfTrailingZeros(highBitMask1) >> 3);
+
+            readBuffer1 = lastRead & ~mask1;
+            hash ^= readBuffer1;
+
+            int delimiter1 = position1 == 0 ? 0 : position1; // not nnecessary, but faster?
+
+            if (delimiter1 != 0) {
+                hash ^= hash >> 32;
+                readBuffer2 = 0;
+                ptr += delimiter1;
+                return false;
+            }
+
+            lastRead = UNSAFE.getLong(ptr + 8);
+
+            // Repeat for long2
+            long comparisonResult2 = (lastRead ^ DELIMITER_MASK);
+            long highBitMask2 = (comparisonResult2 - 0x0101010101010101L) & (~comparisonResult2 & 0x8080808080808080L);
+            boolean noContent2 = highBitMask2 == 0;
+            long mask2 = noContent2 ? 0 : ~((highBitMask2 >>> 7) - 1);
+            int position2 = noContent2 ? 0 : 1 + (Long.numberOfTrailingZeros(highBitMask2) >> 3);
+
+            // Apply masks
+            readBuffer2 = lastRead & ~mask2;
+            hash ^= readBuffer2;
+
+            int delimiter2 = position2 == 0 ? 0 : position2 + 8; // not necessary, but faster?
+
+            hash ^= hash >> 32;
+
+            if (delimiter2 != 0) {
+                ptr += delimiter2;
+                return false;
+            }
+            ptr += 16;
+            return true;
+        }
+
+        private int processEndAndGetTemperature() {
+            finalizeHash();
+            return readTemperature();
+        }
+
+        private void finalizeHash() {
+            hash ^= hash >> 17; // extra entropy
+        }
+
+        private static final long DOT_BITS = 0x10101000;
+        private static final long MAGIC_MULTIPLIER = (100 * 0x1000000 + 10 * 0x10000 + 1);
+
+        // Awesome idea of merykitty:
+        private int readTemperature() {
+            // This is the number part: X.X, -X.X, XX.x or -XX.X
+            final long numberBytes = UNSAFE.getLong(ptr);
+            final long invNumberBytes = ~numberBytes;
+
+            final int dotPosition = Long.numberOfTrailingZeros(invNumberBytes & DOT_BITS);
+
+            // Calculates the sign
+            final long signed = (invNumberBytes << 59) >> 63;
+            final int min28 = (dotPosition ^ 0b11100);
+            final long minusFilter = ~(signed & 0xFF);
+            // Use the pre-calculated decimal position to adjust the values
+            final long digits = ((numberBytes & minusFilter) << min28) & 0x0F000F0F00L;
+
+            // Update the pointer here, bit awkward, but we have all the data
+            ptr += (dotPosition >> 3) + 3;
+
+            // Multiply by a magic (100 * 0x1000000 + 10 * 0x10000 + 1), to get the result
+            final long absValue = ((digits * MAGIC_MULTIPLIER) >>> 32) & 0x3FF;
+            // And perform abs()
+            return (int) ((absValue + signed) ^ signed); // non-patented method of doing the same trick
+        }
+
+        private boolean matches(final byte[] entry) {
+            int step = 0;
+            for (; step < entryLength - 16;) {
+                if (compare(null, entryStart + step, entry, ENTRY_NAME + step)) {
+                    return false;
+                }
+                step += 8;
+            }
+            if (compare(readBuffer1, entry, ENTRY_NAME + step)) {
+                return false;
+            }
+            step += 8;
+            if (compare(readBuffer2, entry, ENTRY_NAME + step)) {
+                return false;
+            }
+            return true;
+        }
+
+        private boolean matches16(final byte[] entry) {
+            if (compare(readBuffer1, entry, ENTRY_NAME)) {
+                return false;
+            }
+            if (compare(readBuffer2, entry, ENTRY_NAME + 8)) {
+                return false;
+            }
+            return true;
         }
     }
 
-    private void run() throws Exception {
+    private static byte[][] processMemoryArea(final long startAddress, final long endAddress, boolean isFileStart) {
 
-        var results = getFileSegments(new File(FILE)).stream().map(segment -> {
+        final byte[][] table = new byte[TABLE_SIZE][];
+        final byte[][] preConstructedEntries = new byte[PREMADE_ENTRIES][ENTRY_BASESIZE_WHITESPACE + PREMADE_MAX_SIZE];
 
-            long segmentEnd = segment.end();
-            try (var fileChannel = (FileChannel) Files.newByteChannel(Path.of(FILE), StandardOpenOption.READ)) {
-                var bb = fileChannel.map(FileChannel.MapMode.READ_ONLY, segment.start(), segmentEnd - segment.start());
+        final Reader reader = new Reader(startAddress, endAddress, isFileStart);
 
-                // Work with any UTF-8 city name, up to 100 in length:
-                var buffer = new byte[106]; // 100 + ; + -XX.X + \n
-                var cityNameAsLongArray = new long[13]; // 13*8=104=kenough.
-                var delimiterPointerAndHash = new int[2];
+        byte[] entry;
+        int entryCount = 0;
 
-                // Calculate using native ordering (fastest?):
-                bb.order(ByteOrder.nativeOrder());
+        // Find the correct starting position
+        while (reader.hasNext()) {
 
-                // Record the order it is and calculate accordingly:
-                final boolean bufferIsBigEndian = bb.order().equals(ByteOrder.BIG_ENDIAN);
-                MeasurementRepository measurements = new MeasurementRepository();
+            reader.processStart();
 
-                int startPointer;
-                int limit = bb.limit();
-                while ((startPointer = bb.position()) < limit) {
+            if (!reader.readNext()) {
+                // First 16 bytes:
 
-                    // SWAR method to find delimiter *and* record the cityname as long[] *and* calculate a hash:
-                    findNextDelimiterAndCalculateHash(bb, SEPARATOR_PATTERN, startPointer, limit, delimiterPointerAndHash, cityNameAsLongArray, bufferIsBigEndian);
-                    int delimiterPointer = delimiterPointerAndHash[0];
+                int temperature = reader.processEndAndGetTemperature();
 
-                    // Simple lookup is faster for '\n' (just three options)
-                    int endPointer;
-
-                    if (delimiterPointer >= limit) {
-                        bb.position(limit); // skip to next line.
-                        return measurements;
+                // Find or insert the entry:
+                int index = (int) (reader.hash & TABLE_MASK);
+                while (true) {
+                    entry = table[index];
+                    if (entry == null) {
+                        byte[] entryBytes = (entryCount < PREMADE_ENTRIES) ? preConstructedEntries[entryCount++]
+                                : new byte[ENTRY_BASESIZE_WHITESPACE + 16]; // with enough room
+                        table[index] = fillEntry16(entryBytes, 16, temperature, reader.readBuffer1, reader.readBuffer2);
+                        break;
                     }
-
-                    if (bb.get(delimiterPointer + 4) == '\n') {
-                        endPointer = delimiterPointer + 4;
-                    }
-                    else if (bb.get(delimiterPointer + 5) == '\n') {
-                        endPointer = delimiterPointer + 5;
+                    else if (reader.matches16(entry)) {
+                        updateEntry(entry, temperature);
+                        break;
                     }
                     else {
-                        endPointer = delimiterPointer + 6;
+                        // Move to the next index
+                        index = (index + 1) & TABLE_MASK;
                     }
-
-                    // Read the entry in a single get():
-                    bb.get(buffer, 0, endPointer - startPointer);
-                    bb.position(endPointer + 1); // skip to next line.
-
-                    // Extract the measurement value (10x):
-                    final int cityNameLength = delimiterPointer - startPointer;
-                    final int measuredValueLength = endPointer - delimiterPointer - 1;
-                    final int measuredValue = branchlessParseInt(buffer, cityNameLength + 1, measuredValueLength);
-
-                    // Store everything in a custom hashtable:
-                    measurements.update(buffer, cityNameLength, delimiterPointerAndHash[1], cityNameAsLongArray).updateWith(measuredValue);
                 }
-                return measurements;
+                continue;
             }
-            catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-        }).parallel()
-                .flatMap(v -> v.values.stream())
-                .collect(Collectors.toMap(e -> e.cityName, MeasurementRepository.Entry::measurement, Measurement::updateWith, TreeMap::new));
+            while (reader.readNext())
+                ;
 
-        System.out.println(results);
-    }
+            int temperature = reader.processEndAndGetTemperature();
 
-    /**
-     * -------- This section contains SWAR code (SIMD Within A Register) which processes a bytebuffer as longs to find values:
-     */
-    private static final long SEPARATOR_PATTERN = compilePattern((byte) ';');
-    private static final long[] PARTIAL_INDEX_MASKS = new long[]{ 0L, 255L, 65535L, 16777215L, 4294967295L, 1099511627775L, 281474976710655L, 72057594037927935L };
-
-    public void runTests() {
-
-        // Method used for debugging purposes, easy to make mistakes with all the bit hacking.
-
-        // These all have the same hashes:
-        testInput("Delft;-12.4", 0, true, new int[]{ 5, 1718384401 }, new long[]{ 499934586180L });
-        testInput("aDelft;-12.4", 1, true, new int[]{ 6, 1718384401 }, new long[]{ 499934586180L });
-
-        testInput("Delft;-12.4", 0, false, new int[]{ 5, 1718384401 }, new long[]{ 499934586180L });
-        testInput("aDelft;-12.4", 1, false, new int[]{ 6, 1718384401 }, new long[]{ 499934586180L });
-
-        testInput("Rotterdam;-12.4", 0, true, new int[]{ 9, -784321989 }, new long[]{ 7017859899421126482L, 109L });
-        testInput("abcdefghijklmnpoqrstuvwxyzRotterdam;-12.4", 26, true, new int[]{ 35, -784321989 }, new long[]{ 7017859899421126482L, 109L });
-        testInput("abcdefghijklmnpoqrstuvwxyzARotterdam;-12.4", 27, true, new int[]{ 36, -784321989 }, new long[]{ 7017859899421126482L, 109L });
-
-        testInput("Rotterdam;-12.4", 0, false, new int[]{ 9, -784321989 }, new long[]{ 7017859899421126482L, 109L });
-        testInput("abcdefghijklmnpoqrstuvwxyzRotterdam;-12.4", 26, false, new int[]{ 35, -784321989 }, new long[]{ 7017859899421126482L, 109L });
-        testInput("abcdefghijklmnpoqrstuvwxyzARotterdam;-12.4", 27, false, new int[]{ 36, -784321989 }, new long[]{ 7017859899421126482L, 109L });
-
-        // These have different hashes from the strings above:
-        testInput("abcdefghijklmnpoqrstuvwxyzAROtterdam;-12.4", 27, true, new int[]{ 36, -792194501 }, new long[]{ 7017859899421118290L, 109L });
-        testInput("abcdefghijklmnpoqrstuvwxyzAROtterdam;-12.4", 27, false, new int[]{ 36, -792194501 }, new long[]{ 7017859899421118290L, 109L });
-
-        MeasurementRepository repository = new MeasurementRepository();
-
-        // Simulate adding two entries with the same hash:
-        byte[] b1 = "City1;10.0".getBytes();
-        byte[] b2 = "City2;41.1".getBytes();
-        repository.update(b1, 5, 1234, new long[]{ 1234L });
-        repository.update(b2, 5, 1234, new long[]{ 4321L });
-        // And update the same record shouldn't add a third (this happened):
-        repository.update(b1, 5, 1234, new long[]{ 1234L });
-
-        if (repository.values.size() != 2) {
-            System.out.println("Error, should have two entries:");
-            System.out.println(repository.values);
-        }
-
-        MeasurementRepository.Entry firstInserted = repository.values.getFirst();
-        if (!firstInserted.cityName.equals("City1")) {
-            System.out.println("Error, should have correct name: " + firstInserted.cityName);
-        }
-    }
-
-    /**
-     * Already looping the longs here, lets shoehorn in making a hash
-     */
-    private void findNextDelimiterAndCalculateHash(final ByteBuffer bb, final long pattern, final int start, final int limit, final int[] output,
-                                                   final long[] asLong, final boolean bufferBigEndian) {
-        int hash = 1;
-        int i;
-        int lCnt = 0;
-        for (i = start; i <= limit - 8; i += 8) {
-            long word = bb.getLong(i);
-            if (bufferBigEndian)
-                word = Long.reverseBytes(word); // Reversing the bytes is the cheapest way to do this
-            int index = firstAnyPattern(word, pattern);
-            if (index < Long.BYTES) {
-                final long partialHash = word & PARTIAL_INDEX_MASKS[index];
-                asLong[lCnt] = partialHash;
-                hash = 961 * hash + 31 * (int) (partialHash >>> 32) + (int) partialHash;
-                output[0] = (i + index);
-                output[1] = hash;
-                return;
-            }
-            asLong[lCnt++] = word;
-            hash = 961 * hash + 31 * (int) (word >>> 32) + (int) word;
-        }
-        // Handle remaining bytes
-        long partialHash = 0;
-        for (; i < limit; i++) {
-            byte read;
-            if ((read = bb.get(i)) == (byte) pattern) {
-                asLong[lCnt] = partialHash;
-                hash = 961 * hash + 31 * (int) (partialHash >>> 32) + (int) partialHash;
-                output[0] = i;
-                output[1] = hash;
-                return;
-            }
-            partialHash = partialHash << 8 | read;
-        }
-        output[0] = limit; // delimiter not found
-        output[1] = hash;
-    }
-
-    private static long compilePattern(final byte value) {
-        return ((long) value << 56) | ((long) value << 48) | ((long) value << 40) | ((long) value << 32) |
-                ((long) value << 24) | ((long) value << 16) | ((long) value << 8) | (long) value;
-    }
-
-    private static int firstAnyPattern(final long word, final long pattern) {
-        final long match = word ^ pattern;
-        long mask = match - 0x0101010101010101L;
-        mask &= ~match;
-        mask &= 0x8080808080808080L;
-        return Long.numberOfTrailingZeros(mask) >> 3;
-    }
-
-    record FileSegment(long start, long end) {
-    }
-
-    /** Using this way to segment the file is much prettier, from spullara */
-    private static List<FileSegment> getFileSegments(final File file) throws IOException {
-        final int numberOfSegments = Runtime.getRuntime().availableProcessors();
-        final long fileSize = file.length();
-        final long segmentSize = fileSize / numberOfSegments;
-        final List<FileSegment> segments = new ArrayList<>();
-        if (segmentSize < 1000) {
-            segments.add(new FileSegment(0, fileSize));
-            return segments;
-        }
-        try (RandomAccessFile randomAccessFile = new RandomAccessFile(file, "r")) {
-            for (int i = 0; i < numberOfSegments; i++) {
-                long segStart = i * segmentSize;
-                long segEnd = (i == numberOfSegments - 1) ? fileSize : segStart + segmentSize;
-                segStart = findSegment(i, 0, randomAccessFile, segStart, segEnd);
-                segEnd = findSegment(i, numberOfSegments - 1, randomAccessFile, segEnd, fileSize);
-
-                segments.add(new FileSegment(segStart, segEnd));
-            }
-        }
-        return segments;
-    }
-
-    private static long findSegment(final int i, final int skipSegment, RandomAccessFile raf, long location, final long fileSize) throws IOException {
-        if (i != skipSegment) {
-            raf.seek(location);
-            while (location < fileSize) {
-                location++;
-                if (raf.read() == '\n')
-                    return location;
-            }
-        }
-        return location;
-    }
-
-    /**
-     * Branchless parser, goes from String to int (10x):
-     * "-1.2" to -12
-     * "40.1" to 401
-     * etc.
-     *
-     * @param input
-     * @return int value x10
-     */
-    private static int branchlessParseInt(final byte[] input, final int start, final int length) {
-        // 0 if positive, 1 if negative
-        final int negative = ~(input[start] >> 4) & 1;
-        // 0 if nr length is 3, 1 if length is 4
-        final int has4 = ((length - negative) >> 2) & 1;
-
-        final int digit1 = input[start + negative] - '0';
-        final int digit2 = input[start + negative + has4];
-        final int digit3 = input[start + negative + has4 + 2];
-
-        return (-negative ^ (has4 * (digit1 * 100) + digit2 * 10 + digit3 - 528) - negative); // 528 == ('0' * 10 + '0')
-    }
-
-    // branchless max (unprecise for large numbers, but good enough)
-    static int max(final int a, final int b) {
-        final int diff = a - b;
-        final int dsgn = diff >> 31;
-        return a - (diff & dsgn);
-    }
-
-    // branchless min (unprecise for large numbers, but good enough)
-    static int min(final int a, final int b) {
-        final int diff = a - b;
-        final int dsgn = diff >> 31;
-        return b + (diff & dsgn);
-    }
-
-    /**
-     * A normal Java HashMap does all these safety things like boundary checks... we don't need that, we need speeeed.
-     *
-     * So I've written an extremely simple linear probing hashmap that should work well enough.
-     */
-    class MeasurementRepository {
-        private int size = 16384;// 16384; // Much larger than the number of cities, needs power of two
-        private int[] indices = new int[size]; // Hashtable is just an int[]
-
-        MeasurementRepository() {
-            populateEmptyIndices(indices);
-        }
-
-        private void populateEmptyIndices(int[] array) {
-            // Optimized fill with -1, fastest method:
-            int len = array.length;
-            array[0] = -1;
-            // Value of i will be [1, 2, 4, 8, 16, 32, ..., len]
-            for (int i = 1; i < len; i += i) {
-                System.arraycopy(array, 0, array, i, i);
-            }
-        }
-
-        private final List<Entry> values = new ArrayList<>(512);
-
-        record Entry(int hash, long[] cityNameAsLong, String cityName, Measurement measurement) {
-            @Override
-            public String toString() {
-                return cityName + "=" + measurement;
-            }
-        }
-
-        public Measurement update(byte[] buffer, int length, int calculatedHash, long[] cityNameAsLongArray) {
-
-            final int cityNameAsLongLength = 1 + (length >>> 3); // amount of longs that captures this cityname
-
-            int hashtableIndex = (size - 1) & calculatedHash;
-            int valueIndex;
-
-            Entry retrievedEntry = null;
-
-            while (true) { // search for the right spot
-                if ((valueIndex = indices[hashtableIndex]) == -1) {
-                    break; // Empty slot found, stop the loop
+            // Find or insert the entry:
+            int index = (int) (reader.hash & TABLE_MASK);
+            while (true) {
+                entry = table[index];
+                if (entry == null) {
+                    int length = reader.entryLength;
+                    byte[] entryBytes = (length < PREMADE_MAX_SIZE && entryCount < PREMADE_ENTRIES) ? preConstructedEntries[entryCount++]
+                            : new byte[ENTRY_BASESIZE_WHITESPACE + length]; // with enough room
+                    table[index] = fillEntry(entryBytes, reader.entryStart, length, temperature, reader.readBuffer1, reader.readBuffer2);
+                    break;
+                }
+                else if (reader.matches(entry)) {
+                    updateEntry(entry, temperature);
+                    break;
                 }
                 else {
-                    // Non-empty slot, retrieve entry
-                    if ((retrievedEntry = values.get(valueIndex)).hash == calculatedHash &&
-                            arrayEquals(retrievedEntry.cityNameAsLong, cityNameAsLongArray, cityNameAsLongLength)) {
-                        break; // Both hash and cityname match, stop the loop
-                    }
+                    // Move to the next index
+                    index = (index + 1) & TABLE_MASK;
                 }
-                // Move to the next index
-                hashtableIndex = (hashtableIndex + 1) % size;
             }
-
-            if (valueIndex >= 0) {
-                return retrievedEntry.measurement;
-            }
-
-            // --- This is a brand new entry, insert into the hashtable and do the extra calculations (once!)
-
-            // Keep the already processed longs for fast equals:
-            long[] cityNameAsLongArrayCopy = new long[cityNameAsLongLength];
-            System.arraycopy(cityNameAsLongArray, 0, cityNameAsLongArrayCopy, 0, cityNameAsLongLength);
-
-            Entry toAdd = new Entry(calculatedHash, cityNameAsLongArrayCopy, new String(buffer, 0, length), new Measurement());
-
-            // Code to regrow (if we get more unique entries): (not needed/not optimized yet)
-            // if (values.size() > size / 2) {
-            // // We probably don't want this...
-            //
-            // int newSize = size << 1;
-            // int[] newIndices = new int[newSize];
-            // populateEmptyIndices(newIndices);
-            // for (int i = 0; i < values.size(); i++) {
-            // Entry e = values.get(i);
-            // int updatedIndex = (newSize - 1) & e.hash;
-            // newIndices[updatedIndex] = i;
-            // }
-            // indices = newIndices;
-            // size = newSize;
-            // }
-            indices[hashtableIndex] = values.size();
-
-            values.add(toAdd);
-            return toAdd.measurement;
         }
+        return table;
     }
 
-    /**
-     * For case multiple hashes are equal (however unlikely) check the actual key (using longs)
+    private static boolean compare(final Object object1, final long address1, final Object object2, final long address2) {
+        return UNSAFE.getLong(object1, address1) != UNSAFE.getLong(object2, address2);
+    }
+
+    private static boolean compare(final long value1, final Object object2, final long address2) {
+        return value1 != UNSAFE.getLong(object2, address2);
+    }
+
+    /*
+     * `___` ___ ___ _ ___` ` ___ ` _ ` _ ` _` ___
+     * / ` \| _ \ __| \| \ \ / /_\ | | | | | | __|
+     * | () | _ / __|| . |\ V / _ \| |_| |_| | ._|
+     * \___/|_| |___|_|\_| \_/_/ \_\___|\___/|___|
+     * ---------------- BETTER SOFTWARE, FASTER --
+     *
+     * https://www.openvalue.eu/
      */
-    private boolean arrayEquals(final long[] a, final long[] b, final int length) {
-        for (int i = 0; i < length; i++) {
-            if (a[i] != b[i])
-                return false;
+
+    private static Unsafe initUnsafe() {
+        try {
+            final Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
+            theUnsafe.setAccessible(true);
+            return (Unsafe) theUnsafe.get(Unsafe.class);
         }
-        return true;
+        catch (NoSuchFieldException | IllegalAccessException e) {
+            throw new RuntimeException(e);
+        }
     }
 }

@@ -19,6 +19,7 @@ bin/
 
 # NetBeans
 nb-configuration.xml
+nbactions.xml
 
 # Visual Studio Code
 .vscode
@@ -45,3 +46,4 @@ out/
 /measurements*.txt
 /*.out
 out_expected.txt
+/*-timing.json
